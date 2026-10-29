@@ -1,0 +1,297 @@
+#!/usr/bin/env dc
+# scheme.dc -- a small Scheme interpreter written in dc
+#
+# TRACE COPY: same as scheme.dc, plus prints in the reader (U, V, S, %)
+# that show each symbol, number and string being encoded, and in eval (Y)
+# that show each function call with its evaluated arguments and result.
+# Register G (not array G) holds the indent: spaces packed in base 256,
+# two more per nested call, printed with P. Run with trace.sh.
+# Calls are no longer tail calls here, so deep loops use more memory.
+#
+# Run it through scheme.sh, which turns source text into one byte per
+# line (dc can only read lines of dc code, so each line it reads is a
+# number: a character code, _1 for end of input, _3 for "start echoing").
+#
+# ---------------------------------------------------------------------
+# VALUES
+# Every Scheme value is one dc number. The low 3 bits (v % 8) are a tag:
+#   0 fixnum     v = 8*n              (dc numbers are bignums, so these are too)
+#   1 pair       v = 8*cell + 1       car in array A, cdr in array D
+#   2 symbol     v = 8*name + 2       name = the symbol's bytes as one base-256 number
+#   3 closure    v = 8*cell + 3       car = (params . body), cdr = environment
+#   4 primitive  v = 8*id + 4
+#   5 constant   () = 5   #t = 13   #f = 21   unspecified = 29   eof = 37
+#   6 string     v = 8*bytes + 6
+#   7 syntax     v = 16*id + 7        special form
+#                v = 16*cell + 15     macro (cell holds a closure)
+# Symbols need no interning: the same name is always the same number.
+# The big constants in this file are symbols, e.g. if = (105*256+102)*8+2 = 215858.
+# Printing a symbol is just "8/P": dc's P prints a number as its bytes.
+# Cell 0 is reserved so that car of () is unspecified and cdr of () is ().
+#
+# An environment is a list of frames; a frame is an alist of (sym . value).
+# The empty environment () means "global", which is a 1009-bucket hash
+# table in array G, keyed by symbol % 1009.
+#
+# ---------------------------------------------------------------------
+# REGISTERS (dc registers are single characters)
+# values:   h heap pointer   p peeked char (-9 = none)   e error flag
+#           o echo results   i print mode (0 display, 1 write)
+#           s j n u v k r    reader scratch     y lookup key
+#           w f t z          temporaries        _ junk (s_ = drop)
+# locals:   x g m a b        saved with S, restored with L (re-entrant)
+# arrays:   A car   D cdr   G global buckets
+# generic:  ~ drop top      . return      Z drop top and return
+#           $ drop 2nd and return         & drop 2, return unspecified
+# reader:   : P N W K R L T U V d S '  (+ targets 1-9 ` , " @ ( ) * % ^)
+# eval:     c cons  E eval  Y eval dispatch  F lookup  I frame walk
+#           q assq  M evlis  B apply  X apply dispatch  H bind params
+#           Q body  J special forms  O primitives  C global define
+#           l local define  | define  ! error
+# printer:  { print  } print dispatch  ; list tail  ? print rest args
+# folds:    + sum  - difference  = product  < string-append  > 256^len
+# main:     0 read-eval-print loop   / init loop
+#
+# IDIOMS
+#   A B =r     run register r if A = B (also !=r, <r, >r, ...; dc compares
+#              the top of stack against the one below it)
+#   [else] [s_ then] A B !=~ x
+#              if/else without a dedicated register: when A != B the "then"
+#              string is dropped by ~, otherwise "then" runs and its s_
+#              drops the "else" string. The final x makes it a tail call.
+#   [c0] lk0=. s_ [c1] lk1=. s_ ... [default]
+#              a selector: leaves the string for case k on the stack.
+# ---------------------------------------------------------------------
+
+# ---------- generic targets ----------
+[s_]s~
+[q]s.
+[s_q]sZ
+[rs_q]s$
+[s_s_29q]s&
+
+# ---------- heap ----------
+1sh
+29 0:A 5 0:D
+[lh:D lh:A lh8*1+ lh1+sh]sc                        # c: ( car cdr -- pair )
+
+# ---------- reader ----------
+_9sp 0so
+[?sp]s:
+[lp_9=: lp]sP                                      # P: ( -- c ) peek
+[lPx _9sp]sN                                       # N: ( -- c ) consume
+[s_ lNxs_ 1so [> ]P lWx q]s1                       # _3 marker: echo on, prompt
+[s_ lKx lWx q]s2                                   # ; comment
+[lNxs_ lWx]s3                                      # whitespace
+[lPx d_1=Z d_3=1 d59=2 33>3]sW                     # W: skip whitespace
+[lPx d_1=Z d10=Z s_ lNxs_ lKx]sK                   # K: skip to end of line
+
+[s_ 37 q]s4                                        # end of input
+[s_ lNxs_ lLx q]s5                                 # (
+[s_ lNxs_ lRx q]s6                                 # stray ) : ignore
+[s_ lNxs_ 3898412344106 l'x q]s7                       # 'x  -> (quote x)
+[s_ lNxs_ 0ss lSx q]s8                             # "string"
+[s_13]s"
+[s_ lNxs_ 21 lNx 116=" q]s9                        # #t / #f
+[s_ lNxs_ 4286341629544591599051562 l'x q]s`                  # `x
+[s_ 1248745035021982114074002444868108645178 lNxs_]s@
+[s_ lNxs_ 264432046845961002 lPx 64=@ l'x q]s,            # ,x  ,@x
+[lRx 5lcx lcx]s'                                   # ': ( sym -- (sym datum) )
+[lWx lPx d_1=4 d40=5 d41=6 d39=7 d34=8 d35=9 d96=` d44=, s_ lTx]sR   # R: ( -- datum )
+
+[s_ lNxs_ 5 q]s(                                   # ) ends list
+[s_ 5 q]s)                                         # end of input inside list
+[s_ lRx lWx lNxs_ q]s*                             # ( a . b )
+[lWx lPx d41=( d_1=) s_ lRx d370=* lLx lcx]sL      # L: ( -- list ) after "("
+
+[d48>Z d57<Z s_ 1sk]sd                             # d: ( c -- ) k=1 if digit
+[0ss 0sj 0sn 0su 0sv 0sr lUx lVx]sT                    # T: ( -- atom )
+[lPx d33>Z d40=Z d41=Z d34=Z d59=Z d39=Z s_ lNxst
+ [] [s_ ltsu] lj0!=~x
+ [] [s_ ltsv] lj1!=~x
+ [    ]P ltP [  byte ]P ltn [:  ]P lsn [ * 256 + ]P ltn [ = ]P
+ ls256*lt+ss
+ lsn [   (hex ]P 16o lsn 10o [)]P 10P
+ [] [s_ lt48- ln10*+ sn] lt45=~x
+ 0sk lt ldx lrlk+sr
+ lj1+sj lUx]sU                                     # U: collect token chars
+[0sk [] [s_1sk] lrlj!=~x
+ [] [s_ [] [s_1sk] lrlj1-!=~x] lu45!=~x [] [s_0sk] lr0!=~x
+ [[    symbol: name * 8 + 2 = ]P ls8*2+ p]
+ [s_ ln [] [s_0r-] lu45!=~x 8* [    all digits, so fixnum: n * 8 + 0 = ]P p] lk1!=~x]sV   # V: number if all digits (r of j), maybe after a leading -
+
+[s_ [    string: bytes * 8 + 6 = ]P ls8*6+ p q]s%   # closing quote
+[s_ lNx st [lt] [s_10] lt110!=~x [] [s_s_9] lt116!=~x ls256*+ss lSx q]s^   # escapes: n newline, t tab
+[lNx d34=% d_1=% d92=^
+ [    ]P dP [  byte ]P dn [:  ]P lsn [ * 256 + ]P dn [ = ]P
+ ls256*+ss
+ lsn [   (hex ]P 16o lsn 10o [)]P 10P
+ lSx]sS                                            # S: string body
+
+# ---------- environments ----------
+[d5=. d8/;A d8/;A ly=$ s_ 8/;D lqx]sq              # q: ( alist -- pair|() ) key y
+[dst [s_ ly1009%;G lqx]
+     [s_ d8/;A lqx dst [s_ 8/;D lIx] [s_ rs_] lt5=~x] lt5=~x]sI
+[r sy lIx]sF                                       # F: ( sym env -- binding|() )
+[sw sy ly1009%;G lqx dst [lw r8/:D]
+     [s_s_ ly lw lcx ly1009%;G lcx ly1009%:G] lt5!=~x]sC   # C: ( sym val -- )
+[sw lcx lw8/;A lcx lw8/:A]sl                       # l: ( sym val env -- )
+[dst [llx] [s_s_lCx] lt5!=~x]s|                    # |: ( sym val env -- )
+
+# ---------- errors ----------
+[[s_s_] [s_ [error: ]PP 1si l{x 10P] le0!=~x 1se]s!   # !: ( v msg -- )
+
+# ---------- eval ----------
+[le1=& r d8% lYx x]sE                              # E: ( x env -- value )
+[sk
+ [Sx Sg lx8/;A lg lEx d8%st
+  [lx8/;D lg lMx
+   lGP [call (]P lx8/;A 1si l{x d l;x 10P
+   Lxs_ Lgs_
+   lG 65536* 8224+ sG lBx lG 65536/ sG
+   lGP [=> ]P d 1si l{x 10P]
+  [s_ 8/d2%st
+   [2/ lJx sw Lx Lg lwx]
+   [s_ 2/8*3+ lx8/;D lBx d8%st [] [s_ 5lcx 3380864568178 r lcx] lt1=~x
+    d8/;A lx8/:A 8/;D lx8/:D Lx Lg lEx]
+   lt1!=~x]
+  lt7!=~x] lk1=. s_
+ [r lFx dst [8/;D] [s_s_ ly[unbound variable: ]l!x 29] lt5!=~x] lk2=. s_
+ [rs_]]sY                                          # Y: ( tag -- handler )
+
+[Sm dst [Lms_] [s_ d8/;A lm lEx r 8/;D lm lMx lcx Lms_] lt5=~x]sM   # M: ( list env -- values )
+[Sg d8/;Dst [8/;A Lg lEx] [s_ d8/;A lg lEx s_ 8/;D Lg lQx] lt5=~x]sQ   # Q: ( body env -- value )
+
+[sk
+ [Sg Sx lx8/;D8/;A lg lEx st lx8/;D8/;D [] [s_8/;D] lt21!=~x 8/;A Lxs_ Lg lEx] lk1=. s_
+ [s_8/;D8/;A] lk0=. s_
+ [Sg Sx lx8/;D8/;A d8%st [lx8/;D8/;D8/;A lg lEx]
+  [s_ d8/;A r8/;D lx8/;D8/;D lcx 953325622338314 r lcx lg lEx] lt1!=~x
+  lg l|x Lxs_ Lgs_ 29] lk2=. s_
+ [r8/;D r lcx 2+] lk4=. s_
+ [Sg Sx lx8/;D8/;D8/;A lg lEx lx8/;D8/;A lg lFx dst [8/:D]
+  [s_s_s_ ly[unbound variable: ]l!x] lt5!=~x Lxs_ Lgs_ 29] lk3=. s_
+ [r8/;D r lQx] lk5=. s_
+ [Sg Sx lx8/;D8/;A d8/;A r8/;D lx8/;D8/;D lcx 953325622338314 r lcx lg lEx
+  8/16*15+ lg l|x Lxs_ Lgs_ 29]]sJ                 # J: ( id -- handler ) special forms
+
+# ---------- apply ----------
+[le1=& r d8% lXx x]sB                              # B: ( f args -- value )
+[sk
+ [8/lOx x] lk4=. s_
+ [sf lf8/;A8/;A r lHx lf8/;D lcx lf8/;A8/;D r lQx] lk3=. s_
+ [rs_ [not a procedure: ]l!x 29]]sX
+[r d8%st
+ [dst [Sb Sa lb8/;A la8/;A lcx lb8/;D la8/;D lHx lcx Las_ Lbs_] [s_s_s_5] lt5!=~x]
+ [s_ r lcx 5lcx] lt2!=~x]sH                        # H: ( params args -- frame )
+
+# ---------- primitives ----------
+[d5=Z d8/;Dsw 8/;A+ lw l+x]s+
+[d5=Z d8/;Dsw 8/;A- lw l-x]s-
+[d5=Z d8/;Dsw 8/;A* 8/ lw l=x]s=
+[d0=Z 256/ r256*r l>x]s>
+[d5=Z d8/;Dsw 8/;A8/ d1r l>x r st * lt+ lw l<x]s<
+[d5=Z 32P d8/;A 1si l{x 8/;D l?x]s?
+[sk
+ [8/;A d8%st [[car: not a pair: ]l!x 29] [s_8/;A] lt1!=~x] lk0=. s_
+ [8/;A d8%st [[cdr: not a pair: ]l!x 29] [s_8/;D] lt1!=~x] lk1=. s_
+ [d8/;A r8/;D8/;A lcx] lk2=. s_
+ [8/;Ast [21] [s_13] lt5!=~x] lk3=. s_
+ [8/;A8%st [21] [s_13] lt1!=~x] lk4=. s_
+ [d8/;Ast 8/;D8/;Asw [21] [s_13] ltlw!=~x] lk5=. s_
+ [0r l+x] lk6=. s_
+ [d8/;Dst [d8/;A r8/;D l-x] [s_ 8/;A 0r-] lt5!=~x] lk7=. s_
+ [d8/;Ast 8/;D8/;Asw [21] [s_13] ltlw!=~x] lk11=. s_
+ [d8/;Ast 8/;D8/;Asw [21] [s_13] ltlw!>~x] lk12=. s_
+ [d8/;Ast 8/;D8/;Asw [21] [s_13] ltlw!<~x] lk26=. s_
+ [d8/;Ast 8/;D8/;Asw [21] [s_13] ltlw<~x] lk27=. s_
+ [d8/;Ast 8/;D8/;Asw [21] [s_13] ltlw>~x] lk28=. s_
+ [8r l=x] lk8=. s_
+ [d8/;Ast 8/;D8/;Asw [ltlw/8*] [s_ 0[quotient: division by zero: ]l!x 29] lw0!=~x] lk9=. s_
+ [d8/;Ast 8/;D8/;Asw [ltlw%] [s_ 0[remainder: division by zero: ]l!x 29] lw0!=~x] lk10=. s_
+ [8/;Ast [21] [s_13] lt21!=~x] lk24=. s_
+ [] lk25=. s_
+ [d8/;D8/;A r8/;A 8/:A 29] lk13=. s_
+ [d8/;D8/;A r8/;A 8/:D 29] lk14=. s_
+ [8/;A 0si l{x 29] lk15=. s_
+ [8/;A 1si l{x 29] lk16=. s_
+ [s_ 10P 29] lk17=. s_
+ [d8/;A r8/;D8/;A lBx] lk18=. s_
+ [[error: ]P d8/;A 0si l{x 8/;D l?x 10P 1se 29] lk19=. s_
+ [8/;A 8%8*] lk20=. s_
+ [s_ 999999Q] lk21=. s_
+ [8/;A 4-] lk22=. s_
+ [8/;A 4+] lk23=. s_
+ [s_ lz1+dsz 4294967296+ 8*2+] lk29=. s_
+ [0r l<x 8*6+] lk30=. s_
+ [8/;A 6+] lk31=. s_
+ [8/;A 6-]]sO                                      # O: ( id -- code ) primitives
+
+# ---------- printer ----------
+[d8% l}x x]s{                                    # {: ( v -- ) mode in i
+[sk
+ [8/n] lk0=. s_
+ [40P d8/;A l{x 8/;D l;x] lk1=. s_
+ [8/P] lk2=. s_
+ [st [] [s_[()]P] lt5!=~x [] [s_[#t]P] lt13!=~x [] [s_[#f]P] lt21!=~x
+  [] [s_[#<eof>]P] lt37!=~x] lk5=. s_
+ [8/st [] [s_34P] li1!=~x [] [s_ltP] lt0=~x [] [s_34P] li1!=~x] lk6=. s_
+ [s_[#<procedure>]P] lk3=. s_
+ [s_[#<primitive>]P] lk4=. s_
+ [s_[#<syntax>]P]]s}
+[dst [] [s_s_41Pq] lt5!=~x d8%st [[ . ]P l{x 41P] [s_ 32P d8/;A l{x 8/;D l;x] lt1!=~x]s;
+
+# ---------- globals ----------
+0sw [5lw:G lw1+dsw 1009>/]s/ l/x
+0se 0si 0sz
+3898412344106 7 lCx                                     # quote
+215858 23 lCx                                           # if
+883093381280554 39 lCx                                  # define
+15488229642 55 lCx                                      # set!
+953325622338314 71 lCx                                  # lambda
+3380864568178 87 lCx                                    # begin
+248568688929278233016532702074 103 lCx                  # define-macro
+52104082 4 lCx                                          # car
+52110226 12 lCx                                         # cdr
+13345977242 20 lCx                                      # cons
+3795331539450 28 lCx                                    # null?
+3861365101050 36 lCx                                    # pair?
+53185018 44 lCx                                         # eq?
+346 52 lCx                                              # +
+362 60 lCx                                              # -
+338 68 lCx                                              # *
+65404505954689184674 76 lCx                             # quotient
+16881899434229060807570 84 lCx                          # remainder
+490 92 lCx                                              # =
+482 100 lCx                                             # <
+66521440202393358602 108 lCx                            # set-car!
+66521440202394931466 116 lCx                            # set-cdr!
+226107537594977226 124 lCx                              # display
+4104164975402 132 lCx                                   # write
+248590488260277034 140 lCx                              # newline
+3347985949642 148 lCx                                   # apply
+3485694393234 156 lCx                                   # error
+5027072826 164 lCx                                      # %tag
+13619121058 172 lCx                                     # exit
+18733623840170328341712653190921058 180 lCx             # string->symbol
+18736780519609176964620146593985338 188 lCx             # symbol->string
+57899938 196 lCx                                        # not
+14550801314 204 lCx                                     # list
+498 212 lCx                                             # >
+123370 220 lCx                                          # <=
+127466 228 lCx                                          # >=
+909482739354474 236 lCx                                 # gensym
+73178218125665345392574015959842 244 lCx                # string-append
+6066008829297414554631604559115066 252 lCx              # %bytes->string
+6076771460806559790572617320311706 260 lCx              # %string->bytes
+13615477242 44 lCx                                      # eqv?
+
+# ---------- read-eval-print loop ----------
+# Read a datum; stop at end of input; evaluate it in the global environment.
+# In REPL mode (o=1) print the result unless it is unspecified or an error
+# happened, then print a prompt. Clearing the stack each time keeps any
+# leftovers from an error from piling up.
+[lRx d37=Z 8224sG 5lEx [] [s_ dst [] [s_ 1si l{x 10P] lt29=~x] lole-1!=~x
+ [] [s_[> ]P] lo1!=~x c 0se l0x]s0
+l0x
+[] [s_10P] lo1!=~x
